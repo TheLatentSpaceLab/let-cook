@@ -1,4 +1,4 @@
-# letcook
+# let-cook
 
 *Let them cook.* A **tool-agnostic** CLI for running autonomous producer/evaluator loops with AI coding assistants. Scaffold a project, define a task, set quality gates, and let the AI cook until it's done.
 
