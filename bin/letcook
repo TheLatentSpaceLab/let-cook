@@ -141,6 +141,7 @@ cmd_run() {
     local prompt="Read skill.md, program.md, and restrictions.md, then execute the autonomous loop as defined in skill.md."
 
     # Auto-detect tool if not specified
+    local detected=""
     if [ -z "$tool" ]; then
         if command -v claude &>/dev/null; then
             tool="claude"
@@ -151,20 +152,23 @@ cmd_run() {
         elif command -v copilot &>/dev/null; then
             tool="copilot"
         fi
+        if [ -n "$tool" ]; then
+            detected=" (auto-detected)"
+        fi
     fi
 
     echo ""
 
     case "$tool" in
         claude)
-            info "Running with Claude Code..."
+            info "Running with Claude Code${detected}..."
             echo ""
             cd "$target_dir"
             exec claude -p "$prompt" \
                 --allowedTools "Read,Write,Edit,Bash,Glob,Grep,Agent"
             ;;
         aider)
-            info "Running with Aider..."
+            info "Running with Aider${detected}..."
             echo ""
             exec aider \
                 --read "$target_dir/skill.md" \
@@ -173,13 +177,13 @@ cmd_run() {
                 --message "$prompt"
             ;;
         codex)
-            info "Running with Codex CLI..."
+            info "Running with Codex CLI${detected}..."
             echo ""
             cd "$target_dir"
             exec codex exec "$prompt"
             ;;
         copilot)
-            info "Running with GitHub Copilot CLI..."
+            info "Running with GitHub Copilot CLI${detected}..."
             echo ""
             cd "$target_dir"
             exec copilot -p "$prompt"
