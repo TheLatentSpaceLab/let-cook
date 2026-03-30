@@ -59,7 +59,7 @@ letcook init ./my-task
 vim ./my-task/program.md         # define your task
 vim ./my-task/restrictions.md    # set quality gates
 
-# 3. Let him cook
+# 3. Let them cook
 letcook run ./my-task
 ```
 
@@ -232,7 +232,7 @@ The loop stops early when **all hard constraints pass** AND the **score >= compl
 ```bash
 # Interactive (inside Claude Code)
 /start-project ./my-task     # scaffold
-/start-working ./my-task     # let him cook
+/start-working ./my-task     # let them cook
 
 # Headless (unattended)
 letcook run ./my-task --tool claude

@@ -1,495 +1,651 @@
-#!/usr/bin/env bash
-#
-# letcook — let him cook
-#
-# A tool-agnostic standard for running autonomous producer/evaluator loops
-# with AI coding assistants.
-#
-# Usage:
-#   letcook init [dir] [--tool <tool>]   Scaffold a new project
-#   letcook run  [dir] [--tool <tool>]   Run the loop with a specific tool
-#   letcook help                         Show this help message
-#   letcook version                      Show version
+#!/usr/bin/env python3
+"""
+letcook — let them cook
 
-set -euo pipefail
+A tool-agnostic CLI for running autonomous producer/evaluator loops
+with AI coding assistants.
+"""
 
-VERSION="0.1.0"
+import os
+import re
+import select
+import signal
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+from typing import Optional
+
+# Bootstrap: re-exec under the bundled venv if rich isn't available
+_VENV_PYTHON = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+if _VENV_PYTHON.exists():
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.columns import Columns
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.align import Align
+    from rich import box
+except ImportError:
+    print("Error: 'rich' is required. Install it with: pip install rich")
+    sys.exit(1)
+
+VERSION = "0.2.0"
+console = Console()
 
 # --- Resolve install directory ---
 
-# Resolve symlinks so LETCOOK_HOME points to the real install directory
-REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
-SCRIPT_PATH="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
-# Support both repo layout (bin/letcook → ..) and install layout (~/.letcook/bin/letcook → ~/.letcook)
-LETCOOK_HOME="$(dirname "$SCRIPT_PATH")"
+SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
+LETCOOK_HOME = SCRIPT_PATH.parent
 
-# --- Colors ---
+# --- Tool config ---
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+CLAUDE_BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"]
 
-# --- Helpers ---
-
-info()    { echo -e "${CYAN}$1${NC}"; }
-success() { echo -e "${GREEN}$1${NC}"; }
-warn()    { echo -e "${YELLOW}$1${NC}"; }
-err()     { echo -e "${RED}$1${NC}" >&2; }
-
-parse_frontmatter_field() {
-    local file="$1" field="$2"
-    sed -n '/^---$/,/^---$/p' "$file" \
-        | grep -E "^${field}:" \
-        | head -1 \
-        | sed "s/^${field}:[[:space:]]*//" \
-        | sed 's/[[:space:]]*#.*//' \
-        | tr -d '[:space:]'
+CLAUDE_TOOLS_BY_TYPE: dict[str, list[str]] = {
+    "build":      [],
+    "refactor":   [],
+    "research":   ["WebSearch", "WebFetch"],
+    "content":    ["WebSearch", "WebFetch"],
+    "experiment": ["WebSearch", "WebFetch", "NotebookEdit"],
 }
 
-parse_program_type() {
-    parse_frontmatter_field "$1" "type"
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "Read":         "Read files",
+    "Write":        "Create/overwrite files",
+    "Edit":         "Targeted file edits",
+    "Bash":         "Run shell commands",
+    "Glob":         "Find files by pattern",
+    "Grep":         "Search file contents",
+    "Agent":        "Spawn subagents",
+    "WebSearch":    "Web search",
+    "WebFetch":     "Fetch URL content",
+    "NotebookEdit": "Edit Jupyter notebooks",
 }
 
-claude_tools_for_type() {
-    local base="Read,Write,Edit,Bash,Glob,Grep,Agent"
-    case "${1:-build}" in
-        research)   echo "$base,WebSearch,WebFetch" ;;
-        content)    echo "$base,WebSearch,WebFetch" ;;
-        experiment) echo "$base,WebSearch,WebFetch,NotebookEdit" ;;
-        *)          echo "$base" ;;
-    esac
-}
 
-parse_goal() {
-    local file="$1"
-    local in_goal=false
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^##[[:space:]]+Goal ]]; then
-            in_goal=true
+# --- Frontmatter parsing ---
+
+def parse_frontmatter(file: Path) -> dict[str, str]:
+    """Extract YAML-like frontmatter fields from a markdown file."""
+    text = file.read_text()
+    match = re.match(r"^---\n(.*?\n)---", text, re.DOTALL)
+    if not match:
+        return {}
+    fields: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        m = re.match(r"^(\w+):\s*(.+?)(?:\s*#.*)?$", line)
+        if m:
+            fields[m.group(1).strip()] = m.group(2).strip()
+    return fields
+
+
+def parse_goal(file: Path) -> str:
+    """Extract the first non-empty line from the ## Goal section."""
+    in_goal = False
+    for line in file.read_text().splitlines():
+        if re.match(r"^##\s+Goal", line):
+            in_goal = True
             continue
-        fi
-        if $in_goal; then
-            [[ "$line" =~ ^## ]] && break
-            [[ "$line" =~ ^\<\!-- ]] && continue
-            [[ -z "$line" ]] && continue
-            echo "$line"
-            return
-        fi
-    done < "$file"
-}
+        if in_goal:
+            if re.match(r"^##\s", line):
+                break
+            if line.startswith("<!--") or not line.strip():
+                continue
+            return line.strip()
+    return "(not set)"
 
-count_constraints() {
-    local file="$1" section="$2"
-    local in_section=false count=0
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^##[[:space:]]+"$section" ]]; then
-            in_section=true
+
+def count_constraints(file: Path, section: str) -> int:
+    """Count bullet items in a named section."""
+    in_section = False
+    count = 0
+    for line in file.read_text().splitlines():
+        if re.match(rf'^##\s+{re.escape(section)}', line):
+            in_section = True
             continue
-        fi
-        if $in_section; then
-            [[ "$line" =~ ^## ]] && break
-            [[ "$line" =~ ^\<\!-- ]] && continue
-            [[ "$line" =~ ^-[[:space:]]+.+ ]] && ((count++))
-        fi
-    done < "$file"
-    echo "$count"
+        if in_section:
+            if re.match(r"^##\s", line):
+                break
+            if line.startswith("<!--"):
+                continue
+            if re.match(r"^-\s+\S", line):
+                count += 1
+    return count
+
+
+# --- Loop state parsing ---
+
+def parse_loop_state(file: Path) -> tuple[int, str, str]:
+    """Parse loop-state.md and return (iteration, score, status)."""
+    if not file.exists():
+        return (0, "-", "ready")
+    iteration, score, status = 0, "-", "ready"
+    for line in file.read_text().splitlines():
+        m = re.match(r"^##\s+Iteration\s+(\d+)", line)
+        if m:
+            iteration = int(m.group(1))
+        m = re.match(r"^\*\*Score\*\*:\s*(\d+)", line)
+        if m:
+            score = m.group(1)
+        m = re.match(r"^\*\*Status\*\*:\s*(.+)", line)
+        if m:
+            status = m.group(1).strip()
+        if re.match(r"^##\s+Summary", line):
+            status = "done"
+    return (iteration, score, status)
+
+
+def format_elapsed(seconds: int) -> str:
+    """Format seconds as human-readable elapsed time."""
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+# --- Status display ---
+
+STATUS_STYLES: dict[str, str] = {
+    "ready":             "bold cyan",
+    "running":           "bold yellow",
+    "passed":            "bold green",
+    "completed":         "bold green",
+    "done":              "bold green",
+    "failed":            "bold red",
+    "exhausted":         "bold red",
+    "needs_improvement": "bold yellow",
+    "stopped":           "bold yellow",
 }
 
-format_elapsed() {
-    local seconds="$1"
-    local h=$((seconds / 3600))
-    local m=$(( (seconds % 3600) / 60 ))
-    local s=$((seconds % 60))
-    if (( h > 0 )); then
-        printf "%dh %02dm %02ds" "$h" "$m" "$s"
-    elif (( m > 0 )); then
-        printf "%dm %02ds" "$m" "$s"
-    else
-        printf "%ds" "$s"
-    fi
-}
 
-parse_loop_state() {
-    local file="$1"
-    local iteration=0 score="-" status="ready" last_status=""
-    if [ ! -f "$file" ]; then
-        echo "0 - ready"
-        return
-    fi
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^##[[:space:]]+Iteration[[:space:]]+([0-9]+) ]]; then
-            iteration="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^\*\*Score\*\*:[[:space:]]*([0-9]+) ]]; then
-            score="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^\*\*Status\*\*:[[:space:]]*(.+) ]]; then
-            last_status="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^##[[:space:]]+Summary ]]; then
-            last_status="done"
-        fi
-    done < "$file"
-    status="${last_status:-running}"
-    echo "$iteration $score $status"
-}
+def build_status_panel(
+    goal: str,
+    prog_type: str,
+    tool_name: str,
+    iteration: int,
+    max_iter: int,
+    threshold: int,
+    score: str,
+    status: str,
+    elapsed: str,
+    hard: int,
+    soft: int,
+    output_dir: str,
+    allowed_tools: Optional[list[str]] = None,
+) -> Panel:
+    """Build a rich Panel showing the current loop status."""
+    style = STATUS_STYLES.get(status, "bold white")
 
-print_status_box() {
-    local goal="$1" prog_type="$2" tool_name="$3" iteration="$4"
-    local max_iter="$5" threshold="$6" score="$7" status="$8"
-    local elapsed="$9" hard="${10}" soft="${11}" output_dir="${12}"
-
-    # Truncate goal to fit box (31 chars for the value column)
-    local max_goal=31
-    if (( ${#goal} > max_goal )); then
-        goal="${goal:0:$((max_goal - 3))}..."
-    fi
-
-    # Status color
-    local status_color="$CYAN"
-    case "$status" in
-        ready)              status_color="$CYAN" ;;
-        running)            status_color="$YELLOW" ;;
-        passed|completed)   status_color="$GREEN" ;;
-        failed|exhausted)   status_color="$RED" ;;
-        needs_improvement)  status_color="$YELLOW" ;;
-        done)               status_color="$GREEN" ;;
-    esac
+    # Progress bar
+    pct = iteration / max_iter if max_iter > 0 else 0
+    bar_width = 20
+    filled = int(pct * bar_width)
+    bar = f"[green]{'━' * filled}[/green][dim]{'━' * (bar_width - filled)}[/dim]"
 
     # Score display
-    local score_display="$score"
-    if [[ "$score" != "-" ]]; then
-        score_display="${score} / ${threshold}"
-    fi
+    if score != "-":
+        score_num = int(score)
+        if score_num >= threshold:
+            score_display = f"[bold green]{score}[/bold green] / {threshold}"
+        elif score_num >= threshold * 0.7:
+            score_display = f"[bold yellow]{score}[/bold yellow] / {threshold}"
+        else:
+            score_display = f"[bold red]{score}[/bold red] / {threshold}"
+    else:
+        score_display = "[dim]—[/dim]"
 
-    printf "\033[2J\033[H"
-    echo -e "${BOLD}┌──────────────────────────────────────────────┐${NC}"
-    echo -e "${BOLD}│${NC}  ${BOLD}letcook${NC}                                     ${BOLD}│${NC}"
-    echo -e "${BOLD}├──────────────────────────────────────────────┤${NC}"
-    printf "${BOLD}│${NC}  Goal:        %-31s ${BOLD}│${NC}\n" "$goal"
-    printf "${BOLD}│${NC}  Type:        %-31s ${BOLD}│${NC}\n" "$prog_type"
-    printf "${BOLD}│${NC}  Tool:        %-31s ${BOLD}│${NC}\n" "$tool_name"
-    printf "${BOLD}│${NC}  Iterations:  %-31s ${BOLD}│${NC}\n" "$iteration / $max_iter"
-    printf "${BOLD}│${NC}  Score:       %-31s ${BOLD}│${NC}\n" "$score_display"
-    printf "${BOLD}│${NC}  Constraints: %-31s ${BOLD}│${NC}\n" "${hard} hard · ${soft} soft"
-    printf "${BOLD}│${NC}  Output:      %-31s ${BOLD}│${NC}\n" "$output_dir"
-    echo -e "${BOLD}├──────────────────────────────────────────────┤${NC}"
-    printf "${BOLD}│${NC}  Status:      ${status_color}%-31s${NC} ${BOLD}│${NC}\n" "$status"
-    printf "${BOLD}│${NC}  Elapsed:     %-31s ${BOLD}│${NC}\n" "$elapsed"
-    echo -e "${BOLD}└──────────────────────────────────────────────┘${NC}"
-}
+    # Status with icon
+    status_icons: dict[str, str] = {
+        "ready":             "◯",
+        "running":           "◉",
+        "passed":            "✓",
+        "completed":         "✓",
+        "done":              "✓",
+        "failed":            "✗",
+        "exhausted":         "✗",
+        "needs_improvement": "△",
+        "stopped":           "⏹",
+    }
+    icon = status_icons.get(status, "?")
 
-STATUS_WATCHER_PID=""
+    # Truncate goal
+    max_goal = 46
+    display_goal = (goal[:max_goal - 1] + "…") if len(goal) > max_goal else goal
 
-cleanup_watcher() {
-    if [ -n "$STATUS_WATCHER_PID" ] && kill -0 "$STATUS_WATCHER_PID" 2>/dev/null; then
-        kill "$STATUS_WATCHER_PID" 2>/dev/null
-        wait "$STATUS_WATCHER_PID" 2>/dev/null
-    fi
-}
+    # Build info table
+    info = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+    info.add_column("key", style="dim", width=14, no_wrap=True)
+    info.add_column("value")
 
-start_status_watcher() {
-    local target_dir="$1" goal="$2" prog_type="$3" tool_name="$4"
-    local max_iter="$5" threshold="$6" hard="$7" soft="$8"
-    local output_dir="$9" start_time="${10}"
+    info.add_row("Goal", f"[bold]{display_goal}[/bold]")
+    info.add_row("Type", prog_type)
+    info.add_row("Tool", tool_name)
+    info.add_row("Iterations", f"{iteration} / {max_iter}  {bar}")
+    info.add_row("Score", score_display)
+    info.add_row("Constraints", f"{hard} hard · {soft} soft")
+    info.add_row("Output", f"[dim]{output_dir}[/dim]")
+    info.add_row("", "")
+    info.add_row("Status", f"[{style}]{icon} {status}[/{style}]")
+    info.add_row("Elapsed", elapsed)
 
-    (
-        while true; do
-            local loop_file="$target_dir/loop-state.md"
-            local state
-            state="$(parse_loop_state "$loop_file")"
-            local iteration score status
-            iteration="$(echo "$state" | cut -d' ' -f1)"
-            score="$(echo "$state" | cut -d' ' -f2)"
-            status="$(echo "$state" | cut -d' ' -f3-)"
+    # Build allowed tools section for Claude
+    if allowed_tools:
+        info.add_row("", "")
+        tools_table = Table(
+            show_header=True, box=box.SIMPLE, padding=(0, 1),
+            header_style="bold dim", expand=True,
+        )
+        tools_table.add_column("Allowed Tool", style="cyan", no_wrap=True)
+        tools_table.add_column("Description", style="dim")
+        for tool in allowed_tools:
+            desc = TOOL_DESCRIPTIONS.get(tool, "")
+            tools_table.add_row(tool, desc)
+        info.add_row("Tools", tools_table)
 
-            local now elapsed_str
-            now="$(date +%s)"
-            elapsed_str="$(format_elapsed $((now - start_time)))"
+    info.add_row("", "")
+    info.add_row("Log", "[dim italic]tail -f .letcook.log[/dim italic]")
+    info.add_row("", "[dim italic]Press ESC to stop gracefully[/dim italic]")
 
-            print_status_box "$goal" "$prog_type" "$tool_name" \
-                "$iteration" "$max_iter" "$threshold" "$score" "$status" \
-                "$elapsed_str" "$hard" "$soft" "$output_dir"
+    return Panel(
+        info,
+        title="[bold]🍳 letcook[/bold]",
+        subtitle=f"[dim]v{VERSION}[/dim]",
+        border_style="bright_blue",
+        padding=(1, 2),
+        expand=False,
+        width=64,
+    )
 
-            [[ "$status" == "done" || "$status" == "completed" || "$status" == "exhausted" ]] && break
-            sleep 5
-        done
-    ) &
-    STATUS_WATCHER_PID=$!
-}
 
-copy_if_missing() {
-    local src="$1" dst="$2"
-    if [ -f "$dst" ]; then
-        warn "  SKIP   $dst (already exists)"
-    else
-        cp "$src" "$dst"
-        success "  CREATE $dst"
-    fi
-}
+# --- File copy helper ---
+
+def copy_if_missing(src: Path, dst: Path) -> None:
+    """Copy a file if it doesn't already exist at the destination."""
+    if dst.exists():
+        console.print(f"  [yellow]SKIP[/yellow]   {dst} [dim](already exists)[/dim]")
+    else:
+        shutil.copy2(src, dst)
+        console.print(f"  [green]CREATE[/green] {dst}")
+
+
+# --- Tool integration installer ---
+
+def install_tool_integration(tool: str, target: Path) -> None:
+    """Install tool-specific integration files into the target directory."""
+    integrations: dict[str, list[tuple[str, str]]] = {
+        "claude": [
+            ("integrations/claude/skills/start-project/SKILL.md",
+             ".claude/skills/start-project/SKILL.md"),
+            ("integrations/claude/skills/start-working/SKILL.md",
+             ".claude/skills/start-working/SKILL.md"),
+        ],
+        "cursor": [
+            ("integrations/cursor/autonomous-loop.mdc",
+             ".cursor/rules/autonomous-loop.mdc"),
+        ],
+        "windsurf": [
+            ("integrations/windsurf/autonomous-loop.md",
+             ".windsurf/rules/autonomous-loop.md"),
+        ],
+        "continue": [
+            ("integrations/continue/autonomous-loop.md",
+             ".continue/rules/autonomous-loop.md"),
+        ],
+        "aider": [
+            ("integrations/aider/.aider.conf.yml", ".aider.conf.yml"),
+        ],
+    }
+
+    if tool not in integrations:
+        console.print(
+            f"  [yellow]Unknown tool '{tool}'. "
+            f"Supported: {', '.join(integrations)}[/yellow]"
+        )
+        return
+
+    for src_rel, dst_rel in integrations[tool]:
+        src = LETCOOK_HOME / src_rel
+        dst = target / dst_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        copy_if_missing(src, dst)
+
 
 # --- Commands ---
 
-cmd_help() {
-    cat <<'HELP'
-letcook — let him cook
+def cmd_help() -> None:
+    """Show help message."""
+    help_table = Table(
+        show_header=True, box=box.ROUNDED, border_style="bright_blue",
+        title="[bold]🍳 letcook[/bold] — let them cook",
+        padding=(0, 1),
+    )
+    help_table.add_column("Command", style="bold cyan", no_wrap=True)
+    help_table.add_column("Description")
 
-Usage:
-  letcook init [dir] [--tool <tool>]   Scaffold a new project
-  letcook run  [dir] [--tool <tool>]   Run the loop with a specific tool
-  letcook help                         Show this help
-  letcook version                      Show version
+    help_table.add_row("init [dir] [--tool <tool>]", "Scaffold a new project")
+    help_table.add_row("run  [dir] [--tool <tool>]", "Run the loop with a specific tool")
+    help_table.add_row("help", "Show this help")
+    help_table.add_row("version", "Show version")
 
-Tools:
-  claude      Claude Code (slash commands + headless CLI)
-  cursor      Cursor (rules file)
-  windsurf    Windsurf (rules file)
-  continue    Continue.dev (rules file)
-  aider       Aider (config file)
-  codex       OpenAI Codex CLI (prints command)
-  copilot     GitHub Copilot CLI (prints command)
+    console.print()
+    console.print(help_table)
+    console.print()
 
-Examples:
-  letcook init ./my-task                Scaffold with no tool integration
-  letcook init ./my-task --tool claude  Scaffold + Claude Code skills
-  letcook run ./my-task --tool claude   Run headless with Claude Code
-  letcook run ./my-task --tool aider    Run with Aider
-HELP
-}
+    tools_table = Table(
+        show_header=True, box=box.SIMPLE, padding=(0, 1),
+        title="[bold]Supported Tools[/bold]",
+    )
+    tools_table.add_column("Tool", style="cyan", no_wrap=True)
+    tools_table.add_column("Description", style="dim")
 
-cmd_version() {
-    echo "letcook $VERSION"
-}
+    tools = [
+        ("claude", "Claude Code (headless CLI)"),
+        ("cursor", "Cursor (rules file)"),
+        ("windsurf", "Windsurf (rules file)"),
+        ("continue", "Continue.dev (rules file)"),
+        ("aider", "Aider (config file)"),
+        ("codex", "OpenAI Codex CLI"),
+        ("copilot", "GitHub Copilot CLI"),
+    ]
+    for name, desc in tools:
+        tools_table.add_row(name, desc)
 
-cmd_init() {
-    local target_dir="."
-    local tool=""
+    console.print(tools_table)
+    console.print()
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --tool) tool="$2"; shift 2 ;;
-            *)      target_dir="$1"; shift ;;
-        esac
-    done
+    console.print("[dim]Examples:[/dim]")
+    console.print("  letcook init ./my-task                [dim]# scaffold[/dim]")
+    console.print("  letcook init ./my-task --tool claude  [dim]# scaffold + Claude skills[/dim]")
+    console.print("  letcook run  ./my-task --tool claude  [dim]# run headless[/dim]")
+    console.print()
 
-    mkdir -p "$target_dir/specs"
 
-    echo ""
-    info "${BOLD}Initializing autonomous loop project...${NC}"
-    echo ""
+def cmd_version() -> None:
+    """Print version."""
+    console.print(f"[bold]letcook[/bold] {VERSION}")
 
-    # Core files
-    copy_if_missing "$LETCOOK_HOME/skill.md"               "$target_dir/specs/skill.md"
-    copy_if_missing "$LETCOOK_HOME/templates/program.md"    "$target_dir/specs/program.md"
-    copy_if_missing "$LETCOOK_HOME/templates/restrictions.md" "$target_dir/specs/restrictions.md"
 
-    # Tool integration
-    if [ -n "$tool" ]; then
-        echo ""
-        install_tool_integration "$tool" "$target_dir"
-    fi
+def cmd_init(args: list[str]) -> None:
+    """Scaffold a new project."""
+    target_dir = Path(".")
+    tool = ""
 
-    echo ""
-    success "${BOLD}Project initialized in $target_dir${NC}"
-    echo ""
-    echo -e "Next steps:"
-    echo -e "  1. Edit ${BOLD}$target_dir/specs/program.md${NC}      — define your task"
-    echo -e "  2. Edit ${BOLD}$target_dir/specs/restrictions.md${NC}  — set quality gates"
-    echo -e "  3. Run:  ${CYAN}letcook run $target_dir${NC}"
-    echo ""
-}
+    i = 0
+    while i < len(args):
+        if args[i] == "--tool" and i + 1 < len(args):
+            tool = args[i + 1]
+            i += 2
+        else:
+            target_dir = Path(args[i])
+            i += 1
 
-cmd_run() {
-    local target_dir="."
-    local tool=""
+    specs_dir = target_dir / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --tool) tool="$2"; shift 2 ;;
-            *)      target_dir="$1"; shift ;;
-        esac
-    done
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Initializing autonomous loop project…[/bold]",
+            border_style="bright_blue",
+            padding=(0, 1),
+        )
+    )
+    console.print()
 
-    # Validate project files exist
-    for file in specs/skill.md specs/program.md specs/restrictions.md; do
-        if [ ! -f "$target_dir/$file" ]; then
-            err "Missing $target_dir/$file"
-            err "Run 'letcook init $target_dir' first."
-            exit 1
-        fi
-    done
+    copy_if_missing(LETCOOK_HOME / "skill.md", specs_dir / "skill.md")
+    copy_if_missing(
+        LETCOOK_HOME / "templates" / "program.md", specs_dir / "program.md"
+    )
+    copy_if_missing(
+        LETCOOK_HOME / "templates" / "restrictions.md", specs_dir / "restrictions.md"
+    )
 
-    local prompt="Read specs/skill.md, specs/program.md, and specs/restrictions.md, then execute the autonomous loop as defined in specs/skill.md."
+    if tool:
+        console.print()
+        install_tool_integration(tool, target_dir)
 
-    # Auto-detect tool if not specified
-    local detected=""
-    if [ -z "$tool" ]; then
-        if command -v claude &>/dev/null; then
-            tool="claude"
-        elif command -v aider &>/dev/null; then
-            tool="aider"
-        elif command -v codex &>/dev/null; then
-            tool="codex"
-        elif command -v copilot &>/dev/null; then
-            tool="copilot"
-        fi
-        if [ -n "$tool" ]; then
-            detected=" (auto-detected)"
-        fi
-    fi
+    console.print()
+    console.print("[bold green]Project initialized![/bold green]")
+    console.print()
+    console.print("[dim]Next steps:[/dim]")
+    console.print(f"  1. Edit [bold]{specs_dir}/program.md[/bold]      — define your task")
+    console.print(f"  2. Edit [bold]{specs_dir}/restrictions.md[/bold] — set quality gates")
+    console.print(f"  3. Run:  [cyan]letcook run {target_dir}[/cyan]")
+    console.print()
 
-    echo ""
 
-    # Parse project metadata for status display
-    local program_file="$target_dir/specs/program.md"
-    local restrictions_file="$target_dir/specs/restrictions.md"
-    local program_type
-    program_type="$(parse_program_type "$program_file")"
-    program_type="${program_type:-build}"
-    local max_iter
-    max_iter="$(parse_frontmatter_field "$program_file" "iterations")"
-    max_iter="${max_iter:-5}"
-    local threshold
-    threshold="$(parse_frontmatter_field "$program_file" "completion_threshold")"
-    threshold="${threshold:-90}"
-    local output_dir
-    output_dir="$(parse_frontmatter_field "$program_file" "output")"
-    output_dir="${output_dir:-./output/}"
-    local goal
-    goal="$(parse_goal "$program_file")"
-    goal="${goal:-(not set)}"
-    local hard soft
-    hard="$(count_constraints "$restrictions_file" "Hard Constraints")"
-    soft="$(count_constraints "$restrictions_file" "Soft Constraints")"
+def get_allowed_tools(prog_type: str) -> list[str]:
+    """Get the full allowed tools list for a program type."""
+    extra = CLAUDE_TOOLS_BY_TYPE.get(prog_type, [])
+    return CLAUDE_BASE_TOOLS + extra
 
-    case "$tool" in
-        claude)
-            local allowed_tools
-            allowed_tools="$(claude_tools_for_type "$program_type")"
-            local tool_label="claude${detected}"
-            local start_time
-            start_time="$(date +%s)"
 
-            trap cleanup_watcher EXIT INT TERM
+def cmd_run(args: list[str]) -> None:
+    """Run the autonomous loop."""
+    target_dir = Path(".")
+    tool = ""
 
-            start_status_watcher "$target_dir" "$goal" "$program_type" \
-                "$tool_label" "$max_iter" "$threshold" "$hard" "$soft" \
-                "$output_dir" "$start_time"
+    i = 0
+    while i < len(args):
+        if args[i] == "--tool" and i + 1 < len(args):
+            tool = args[i + 1]
+            i += 2
+        else:
+            target_dir = Path(args[i])
+            i += 1
 
-            cd "$target_dir"
-            claude -p "$prompt" --allowedTools "$allowed_tools" > /dev/null 2>&1
-            local exit_code=$?
+    # Validate project files
+    for spec in ["specs/skill.md", "specs/program.md", "specs/restrictions.md"]:
+        if not (target_dir / spec).exists():
+            console.print(f"[bold red]Missing {target_dir / spec}[/bold red]")
+            console.print(f"Run [cyan]letcook init {target_dir}[/cyan] first.")
+            sys.exit(1)
 
-            cleanup_watcher
+    prompt = (
+        "Read specs/skill.md, specs/program.md, and specs/restrictions.md, "
+        "then execute the autonomous loop as defined in specs/skill.md."
+    )
 
-            # Final status
-            local state
-            state="$(parse_loop_state "loop-state.md")"
-            local iteration score status
-            iteration="$(echo "$state" | cut -d' ' -f1)"
-            score="$(echo "$state" | cut -d' ' -f2)"
-            status="$(echo "$state" | cut -d' ' -f3-)"
+    # Auto-detect tool
+    detected = ""
+    if not tool:
+        for candidate in ["claude", "aider", "codex", "copilot"]:
+            if shutil.which(candidate):
+                tool = candidate
+                detected = " (auto-detected)"
+                break
 
-            local end_time elapsed_str
-            end_time="$(date +%s)"
-            elapsed_str="$(format_elapsed $((end_time - start_time)))"
+    # Parse project metadata
+    program_file = target_dir / "specs" / "program.md"
+    restrictions_file = target_dir / "specs" / "restrictions.md"
 
-            print_status_box "$goal" "$program_type" "$tool_label" \
-                "$iteration" "$max_iter" "$threshold" "$score" "$status" \
-                "$elapsed_str" "$hard" "$soft" "$output_dir"
+    fm = parse_frontmatter(program_file)
+    prog_type = fm.get("type", "build")
+    max_iter = int(fm.get("iterations", "5"))
+    threshold = int(fm.get("completion_threshold", "90"))
+    output_dir = fm.get("output", "./output/")
+    goal = parse_goal(program_file)
+    hard = count_constraints(restrictions_file, "Hard Constraints")
+    soft = count_constraints(restrictions_file, "Soft Constraints")
 
-            echo ""
-            if [ $exit_code -eq 0 ]; then
-                success "Done."
-            else
-                err "Claude exited with code $exit_code"
-            fi
-            exit $exit_code
-            ;;
-        aider)
-            info "Running with Aider${detected}..."
-            echo ""
-            exec aider \
-                --read "$target_dir/specs/skill.md" \
-                --read "$target_dir/specs/program.md" \
-                --read "$target_dir/specs/restrictions.md" \
-                --message "$prompt"
-            ;;
-        codex)
-            info "Running with Codex CLI${detected}..."
-            echo ""
-            cd "$target_dir"
-            exec codex exec "$prompt"
-            ;;
-        copilot)
-            info "Running with GitHub Copilot CLI${detected}..."
-            echo ""
-            cd "$target_dir"
-            exec copilot -p "$prompt"
-            ;;
-        "")
-            warn "No AI tool detected. Paste this prompt into your AI assistant:"
-            echo ""
-            echo -e "  ${BOLD}$prompt${NC}"
-            echo ""
-            echo "Or install one of: claude, aider, codex, copilot"
-            ;;
-        *)
-            err "Tool '$tool' doesn't support headless execution."
-            echo ""
-            echo "For $tool, open the project in your IDE and tell the AI:"
-            echo ""
-            echo -e "  ${BOLD}Start working on this project.${NC}"
-            echo ""
-            ;;
-    esac
-}
+    console.print()
 
-install_tool_integration() {
-    local tool="$1"
-    local target_dir="$2"
+    if tool == "claude":
+        allowed_tools = get_allowed_tools(prog_type)
+        allowed_tools_str = ",".join(allowed_tools)
+        tool_label = f"claude{detected}"
+        start_time = int(time.time())
 
-    case "$tool" in
-        claude)
-            mkdir -p "$target_dir/.claude/skills/start-project"
-            mkdir -p "$target_dir/.claude/skills/start-working"
-            copy_if_missing "$LETCOOK_HOME/integrations/claude/skills/start-project/SKILL.md" \
-                           "$target_dir/.claude/skills/start-project/SKILL.md"
-            copy_if_missing "$LETCOOK_HOME/integrations/claude/skills/start-working/SKILL.md" \
-                           "$target_dir/.claude/skills/start-working/SKILL.md"
-            ;;
-        cursor)
-            mkdir -p "$target_dir/.cursor/rules"
-            copy_if_missing "$LETCOOK_HOME/integrations/cursor/autonomous-loop.mdc" \
-                           "$target_dir/.cursor/rules/autonomous-loop.mdc"
-            ;;
-        windsurf)
-            mkdir -p "$target_dir/.windsurf/rules"
-            copy_if_missing "$LETCOOK_HOME/integrations/windsurf/autonomous-loop.md" \
-                           "$target_dir/.windsurf/rules/autonomous-loop.md"
-            ;;
-        continue)
-            mkdir -p "$target_dir/.continue/rules"
-            copy_if_missing "$LETCOOK_HOME/integrations/continue/autonomous-loop.md" \
-                           "$target_dir/.continue/rules/autonomous-loop.md"
-            ;;
-        aider)
-            copy_if_missing "$LETCOOK_HOME/integrations/aider/.aider.conf.yml" \
-                           "$target_dir/.aider.conf.yml"
-            ;;
-        *)
-            warn "Unknown tool '$tool'. Skipping integration."
-            echo "  Supported: claude, cursor, windsurf, continue, aider"
-            ;;
-    esac
-}
+        os.chdir(target_dir)
+        log_file = Path(".letcook.log")
+        stopped_by_user = False
+
+        with open(log_file, "w") as log:
+            proc = subprocess.Popen(
+                ["claude", "-p", prompt, "--allowedTools", allowed_tools_str],
+                stdout=log, stderr=subprocess.STDOUT,
+            )
+
+            # Set terminal to raw mode to catch ESC
+            old_settings = None
+            stdin_fd = sys.stdin.fileno()
+            try:
+                old_settings = termios.tcgetattr(stdin_fd)
+                tty.setcbreak(stdin_fd)
+            except (termios.error, OSError):
+                pass  # not a tty
+
+            try:
+                while proc.poll() is None:
+                    # Update status display
+                    iteration, score, status = parse_loop_state(
+                        Path("loop-state.md")
+                    )
+                    if proc.poll() is None:
+                        status = status if status != "ready" else "running"
+                    elapsed = format_elapsed(int(time.time()) - start_time)
+
+                    console.clear()
+                    console.print(build_status_panel(
+                        goal, prog_type, tool_label, iteration, max_iter,
+                        threshold, score, status, elapsed, hard, soft,
+                        output_dir, allowed_tools=allowed_tools,
+                    ))
+
+                    # Check for ESC key (poll stdin for 3 seconds)
+                    if old_settings is not None:
+                        ready, _, _ = select.select([stdin_fd], [], [], 3)
+                        if ready:
+                            ch = os.read(stdin_fd, 1)
+                            if ch == b'\x1b':  # ESC
+                                stopped_by_user = True
+                                proc.send_signal(signal.SIGTERM)
+                                proc.wait(timeout=10)
+                                break
+                    else:
+                        time.sleep(3)
+            except KeyboardInterrupt:
+                stopped_by_user = True
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=10)
+            finally:
+                if old_settings is not None:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+
+            exit_code = proc.returncode or 0
+
+        # Final status
+        iteration, score, status = parse_loop_state(Path("loop-state.md"))
+        if stopped_by_user:
+            status = "stopped"
+        elapsed = format_elapsed(int(time.time()) - start_time)
+
+        console.clear()
+        panel = build_status_panel(
+            goal, prog_type, tool_label, iteration, max_iter, threshold,
+            score, status, elapsed, hard, soft, output_dir,
+            allowed_tools=allowed_tools,
+        )
+        console.print(panel)
+        console.print()
+
+        if stopped_by_user:
+            console.print("[bold yellow]⏹ Stopped by user.[/bold yellow]")
+        elif exit_code == 0:
+            console.print("[bold green]✓ Done.[/bold green]")
+        else:
+            console.print(
+                f"[bold red]✗ Claude exited with code {exit_code}[/bold red]"
+            )
+        sys.exit(exit_code)
+
+    elif tool == "aider":
+        console.print(f"[bold cyan]Running with Aider{detected}…[/bold cyan]")
+        console.print()
+        os.execvp("aider", [
+            "aider",
+            "--read", str(target_dir / "specs" / "skill.md"),
+            "--read", str(target_dir / "specs" / "program.md"),
+            "--read", str(target_dir / "specs" / "restrictions.md"),
+            "--message", prompt,
+        ])
+
+    elif tool == "codex":
+        console.print(f"[bold cyan]Running with Codex CLI{detected}…[/bold cyan]")
+        console.print()
+        os.chdir(target_dir)
+        os.execvp("codex", ["codex", "exec", prompt])
+
+    elif tool == "copilot":
+        console.print(
+            f"[bold cyan]Running with GitHub Copilot CLI{detected}…[/bold cyan]"
+        )
+        console.print()
+        os.chdir(target_dir)
+        os.execvp("copilot", ["copilot", "-p", prompt])
+
+    elif not tool:
+        console.print(
+            Panel(
+                "[bold yellow]No AI tool detected.[/bold yellow]\n\n"
+                "Paste this prompt into your AI assistant:\n\n"
+                f"  [bold]{prompt}[/bold]\n\n"
+                "[dim]Or install one of: claude, aider, codex, copilot[/dim]",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
+
+    else:
+        console.print(
+            Panel(
+                f"[bold yellow]Tool '{tool}' doesn't support headless execution.[/bold yellow]\n\n"
+                f"Open the project in your IDE and tell the AI:\n\n"
+                "  [bold]Start working on this project.[/bold]",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
+
 
 # --- Main ---
 
-case "${1:-help}" in
-    init)    shift; cmd_init "$@" ;;
-    run)     shift; cmd_run "$@" ;;
-    help)    cmd_help ;;
-    version) cmd_version ;;
-    *)       err "Unknown command: $1"; echo ""; cmd_help; exit 1 ;;
-esac
+def main() -> None:
+    """Entry point."""
+    args = sys.argv[1:]
+    cmd = args[0] if args else "help"
+    rest = args[1:]
+
+    commands: dict[str, object] = {
+        "init": lambda: cmd_init(rest),
+        "run": lambda: cmd_run(rest),
+        "help": cmd_help,
+        "version": cmd_version,
+    }
+
+    if cmd in commands:
+        commands[cmd]()
+    else:
+        console.print(f"[bold red]Unknown command: {cmd}[/bold red]")
+        console.print()
+        cmd_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -40,6 +40,18 @@ else
     git clone --quiet "$REPO_URL" "$LETCOOK_HOME"
 fi
 
+# Set up Python environment
+info "Setting up Python environment..."
+if command -v uv &>/dev/null; then
+    uv venv --quiet "$LETCOOK_HOME/.venv"
+    uv pip install --quiet --python "$LETCOOK_HOME/.venv/bin/python" rich
+elif command -v python3 &>/dev/null; then
+    python3 -m venv "$LETCOOK_HOME/.venv"
+    "$LETCOOK_HOME/.venv/bin/pip" install --quiet rich
+else
+    err "Python 3 is required. Install it and try again."
+fi
+
 # Symlink binary
 mkdir -p "$BIN_DIR"
 ln -sf "$LETCOOK_HOME/bin/letcook" "$BIN_DIR/letcook"

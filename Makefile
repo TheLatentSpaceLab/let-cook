@@ -13,6 +13,14 @@ install: ## Install letcook to ~/.letcook and symlink to ~/.local/bin
 	@mkdir -p $(PREFIX)
 	@cp -r bin templates integrations skill.md $(PREFIX)/
 	@chmod +x $(PREFIX)/bin/letcook
+	@echo "Setting up Python environment..."
+	@if command -v uv >/dev/null 2>&1; then \
+		uv venv --quiet $(PREFIX)/.venv && \
+		uv pip install --quiet --python $(PREFIX)/.venv/bin/python rich; \
+	else \
+		python3 -m venv $(PREFIX)/.venv && \
+		$(PREFIX)/.venv/bin/pip install --quiet rich; \
+	fi
 	@mkdir -p $(BIN_DIR)
 	@ln -sf $(PREFIX)/bin/letcook $(BIN_DIR)/letcook
 	@echo ""

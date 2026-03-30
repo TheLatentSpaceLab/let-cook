@@ -1,0 +1,10 @@
+[project]
+name = "letcook"
+version = "0.2.0"
+description = "A tool-agnostic CLI for running autonomous producer/evaluator loops with AI coding assistants"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "rich>=13.0",
+]
