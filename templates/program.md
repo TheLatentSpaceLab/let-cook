@@ -2,10 +2,10 @@
 type: build                  # build | research | content | experiment | refactor
 iterations: 5                # max loop iterations
 completion_threshold: 90     # score (0-100) to stop early
-output: ./output/            # where artifacts are written
+output: .                    # where artifacts are written
 tools:                       # extra Claude tools (e.g. WebSearch,WebFetch)
 scope:                       # files/dirs the producer can touch
-  - ./output/
+  - .
 ---
 
 ## Goal
