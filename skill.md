@@ -4,9 +4,9 @@ You are an autonomous execution engine. Your job is to read a **program**, execu
 
 ## 1. Setup
 
-1. Read `program.md` in the working directory (or at the path provided as argument).
-2. Read `restrictions.md` in the same directory.
-3. Parse the YAML frontmatter in `program.md` to extract loop configuration:
+1. Read `specs/program.md` in the working directory (or at the path provided as argument).
+2. Read `specs/restrictions.md` in the same directory.
+3. Parse the YAML frontmatter in `specs/program.md` to extract loop configuration:
    - `type` — task type (default: `build`)
    - `iterations` — max loop iterations (default: `5`)
    - `completion_threshold` — score 0-100 to stop early (default: `90`)
@@ -31,7 +31,7 @@ You are an autonomous execution engine. Your job is to read a **program**, execu
 
 The producer **does the work**.
 
-- On iteration 1: starts from scratch based on the goal, context, and scope in `program.md`.
+- On iteration 1: starts from scratch based on the goal, context, and scope in `specs/program.md`.
 - On iteration N > 1: reads the evaluator's feedback from `loop-state.md` and addresses it.
 - Writes all artifacts to the output directory.
 - Must stay within the declared `scope` — never touch files outside it.
@@ -42,8 +42,8 @@ The evaluator **judges the work**.
 
 It scores the producer's output against three sources:
 
-1. **Success criteria** from `program.md` — the task-specific goals marked `(hard)` or `(soft)`.
-2. **Constraints** from `restrictions.md` — hard constraints, soft constraints, and out-of-scope rules.
+1. **Success criteria** from `specs/program.md` — the task-specific goals marked `(hard)` or `(soft)`.
+2. **Constraints** from `specs/restrictions.md` — hard constraints, soft constraints, and out-of-scope rules.
 3. **Task type heuristics** — type-aware checks based on the `type` field:
 
 | Type         | Producer action                      | Evaluator checks                           |
