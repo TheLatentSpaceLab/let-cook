@@ -340,7 +340,7 @@ def cmd_help() -> None:
     help_table.add_column("Command", style="bold cyan", no_wrap=True)
     help_table.add_column("Description")
 
-    help_table.add_row("init [dir] [tool]", "Scaffold a new project")
+    help_table.add_row("init [dir]", "Scaffold a new project")
     help_table.add_row("run  [dir] [tool]", "Run the loop with a specific tool")
     help_table.add_row("help", "Show this help")
     help_table.add_row("version", "Show version")
@@ -373,11 +373,11 @@ def cmd_help() -> None:
     console.print()
 
     console.print("[dim]Examples:[/dim]")
-    console.print("  letcook init ./my-task                [dim]# scaffold[/dim]")
-    console.print("  letcook init ./my-task claude          [dim]# scaffold + Claude skills[/dim]")
-    console.print("  letcook run  ./my-task claude          [dim]# run with Claude[/dim]")
-    console.print("  letcook run  ./my-task qubito          [dim]# run with Qubito[/dim]")
-    console.print("  letcook run  ./my-task --tool claude   [dim]# --tool also works[/dim]")
+    console.print("  letcook init                          [dim]# scaffold in current dir[/dim]")
+    console.print("  letcook init ./my-task                [dim]# scaffold in a subdirectory[/dim]")
+    console.print("  letcook run  claude                   [dim]# run in current dir with Claude[/dim]")
+    console.print("  letcook run  qubito                   [dim]# run in current dir with Qubito[/dim]")
+    console.print("  letcook run  ./my-task claude          [dim]# run a specific task[/dim]")
     console.print()
 
 
@@ -388,20 +388,7 @@ def cmd_version() -> None:
 
 def cmd_init(args: list[str]) -> None:
     """Scaffold a new project."""
-    target_dir = Path(".")
-    tool = ""
-
-    i = 0
-    while i < len(args):
-        if args[i] == "--tool" and i + 1 < len(args):
-            tool = args[i + 1]
-            i += 2
-        elif args[i] in KNOWN_TOOLS:
-            tool = args[i]
-            i += 1
-        else:
-            target_dir = Path(args[i])
-            i += 1
+    target_dir = Path(args[0]) if args else Path(".")
 
     specs_dir = target_dir / "specs"
     specs_dir.mkdir(parents=True, exist_ok=True)
@@ -423,10 +410,6 @@ def cmd_init(args: list[str]) -> None:
     copy_if_missing(
         LETCOOK_HOME / "templates" / "restrictions.md", specs_dir / "restrictions.md"
     )
-
-    if tool:
-        console.print()
-        install_tool_integration(tool, target_dir)
 
     console.print()
     console.print("[bold green]Project initialized![/bold green]")
