@@ -1,10 +1,10 @@
 # Autonomous Loop — Aider integration
-# Place this file in your project root alongside the specs/ directory containing skill.md, program.md, and restrictions.md
+# Place this file in your project root alongside the specs/ directory containing SKILL.md, PROGRAM.md, and RESTRICTIONS.md
 #
 # Usage:
-#   aider --read specs/skill.md --read specs/program.md --read specs/restrictions.md --message "Execute the autonomous loop as defined in specs/skill.md."
+#   aider --read specs/SKILL.md --read specs/PROGRAM.md --read specs/RESTRICTIONS.md --message "Execute the autonomous loop as defined in specs/SKILL.md."
 
 read:
-  - specs/skill.md
-  - specs/program.md
-  - specs/restrictions.md
+  - specs/SKILL.md
+  - specs/PROGRAM.md
+  - specs/RESTRICTIONS.md

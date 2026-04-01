@@ -16,16 +16,6 @@ scope:                       # files/dirs the producer can touch
 
 <!-- Background the producer needs: links, references, prior art, constraints. -->
 
-## Success Criteria
-
-<!-- The evaluator scores each iteration against these. Mark each as (hard) or (soft). -->
-<!-- Hard: must pass or the iteration fails. Soft: improves the score but not required. -->
-
-- [ ] (hard) ...
-- [ ] (hard) ...
-- [ ] (soft) ...
-- [ ] (soft) ...
-
 ## Notes
 
 <!-- Optional hints, preferences, or things the producer should know. -->

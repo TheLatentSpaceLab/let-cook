@@ -1,5 +1,15 @@
 # Restrictions
 
+## Success Criteria
+
+<!-- The evaluator scores each iteration against these. Mark each as (hard) or (soft). -->
+<!-- Hard: must pass or the iteration fails. Soft: improves the score but not required. -->
+
+- [ ] (hard) ...
+- [ ] (hard) ...
+- [ ] (soft) ...
+- [ ] (soft) ...
+
 ## Hard Constraints
 
 <!-- MUST pass. A single failure means the iteration fails. -->

@@ -41,7 +41,7 @@ except ImportError:
     print("Error: 'rich' is required. Install it with: pip install rich")
     sys.exit(1)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 console = Console()
 
 # --- Resolve install directory ---
@@ -73,6 +73,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "WebFetch":     "Fetch URL content",
     "NotebookEdit": "Edit Jupyter notebooks",
 }
+
+VALID_TYPES = {"build", "research", "content", "experiment", "refactor"}
 
 
 # --- Frontmatter parsing ---
@@ -125,6 +127,22 @@ def count_constraints(file: Path, section: str) -> int:
     return count
 
 
+def section_has_content(file: Path, section: str) -> bool:
+    """Check if a markdown section has non-comment, non-empty content."""
+    in_section = False
+    for line in file.read_text().splitlines():
+        if re.match(rf'^##\s+{re.escape(section)}', line):
+            in_section = True
+            continue
+        if in_section:
+            if re.match(r"^##\s", line):
+                break
+            stripped = line.strip()
+            if stripped and not stripped.startswith("<!--"):
+                return True
+    return False
+
+
 # --- Loop state parsing ---
 
 def parse_loop_state(file: Path) -> tuple[int, str, str]:
@@ -147,6 +165,30 @@ def parse_loop_state(file: Path) -> tuple[int, str, str]:
     return (iteration, score, status)
 
 
+def parse_score_history(file: Path) -> list[int]:
+    """Extract all iteration scores from loop-state.md in order."""
+    if not file.exists():
+        return []
+    scores: list[int] = []
+    for line in file.read_text().splitlines():
+        m = re.match(r"^\*\*Score\*\*:\s*(\d+)", line)
+        if m:
+            scores.append(int(m.group(1)))
+    return scores
+
+
+def score_trend(scores: list[int]) -> str:
+    """Return a rich-formatted trend indicator from score history."""
+    if len(scores) < 2:
+        return ""
+    diff = scores[-1] - scores[-2]
+    if diff > 0:
+        return f" [green]↑+{diff}[/green]"
+    elif diff < 0:
+        return f" [red]↓{diff}[/red]"
+    return " [dim]→[/dim]"
+
+
 def format_elapsed(seconds: int) -> str:
     """Format seconds as human-readable elapsed time."""
     h, rem = divmod(seconds, 3600)
@@ -156,6 +198,21 @@ def format_elapsed(seconds: int) -> str:
     if m > 0:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def format_score_history(scores: list[int]) -> str:
+    """Format score history as a compact sparkline-style display."""
+    if not scores:
+        return ""
+    parts: list[str] = []
+    for s in scores:
+        if s >= 90:
+            parts.append(f"[green]{s}[/green]")
+        elif s >= 60:
+            parts.append(f"[yellow]{s}[/yellow]")
+        else:
+            parts.append(f"[red]{s}[/red]")
+    return " → ".join(parts)
 
 
 # --- Status display ---
@@ -187,6 +244,8 @@ def build_status_panel(
     soft: int,
     output_dir: str,
     allowed_tools: Optional[list[str]] = None,
+    scores: Optional[list[int]] = None,
+    eta: Optional[str] = None,
 ) -> Panel:
     """Build a rich Panel showing the current loop status."""
     style = STATUS_STYLES.get(status, "bold white")
@@ -197,15 +256,16 @@ def build_status_panel(
     filled = int(pct * bar_width)
     bar = f"[green]{'━' * filled}[/green][dim]{'━' * (bar_width - filled)}[/dim]"
 
-    # Score display
+    # Score display with trend
+    trend = score_trend(scores) if scores else ""
     if score != "-":
         score_num = int(score)
         if score_num >= threshold:
-            score_display = f"[bold green]{score}[/bold green] / {threshold}"
+            score_display = f"[bold green]{score}[/bold green] / {threshold}{trend}"
         elif score_num >= threshold * 0.7:
-            score_display = f"[bold yellow]{score}[/bold yellow] / {threshold}"
+            score_display = f"[bold yellow]{score}[/bold yellow] / {threshold}{trend}"
         else:
-            score_display = f"[bold red]{score}[/bold red] / {threshold}"
+            score_display = f"[bold red]{score}[/bold red] / {threshold}{trend}"
     else:
         score_display = "[dim]—[/dim]"
 
@@ -237,11 +297,21 @@ def build_status_panel(
     info.add_row("Tool", tool_name)
     info.add_row("Iterations", f"{iteration} / {max_iter}  {bar}")
     info.add_row("Score", score_display)
+
+    # Score history sparkline
+    if scores and len(scores) > 1:
+        info.add_row("History", format_score_history(scores))
+
     info.add_row("Constraints", f"{hard} hard · {soft} soft")
     info.add_row("Output", f"[dim]{output_dir}[/dim]")
     info.add_row("", "")
     info.add_row("Status", f"[{style}]{icon} {status}[/{style}]")
-    info.add_row("Elapsed", elapsed)
+
+    # Elapsed + ETA
+    elapsed_display = elapsed
+    if eta and status == "running":
+        elapsed_display += f"  [dim]ETA: ~{eta}[/dim]"
+    info.add_row("Elapsed", elapsed_display)
 
     # Build allowed tools section for Claude
     if allowed_tools:
@@ -328,6 +398,330 @@ def install_tool_integration(tool: str, target: Path) -> None:
         copy_if_missing(src, dst)
 
 
+# --- Validation ---
+
+def validate_project(target_dir: Path) -> tuple[list[str], list[str]]:
+    """Validate project files. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # Check required files exist
+    for spec in ["specs/SKILL.md", "specs/PROGRAM.md", "specs/RESTRICTIONS.md"]:
+        if not (target_dir / spec).exists():
+            errors.append(f"Missing {spec}")
+
+    if errors:
+        return errors, warnings
+
+    program_file = target_dir / "specs" / "PROGRAM.md"
+    restrictions_file = target_dir / "specs" / "RESTRICTIONS.md"
+
+    # Validate frontmatter
+    fm = parse_frontmatter(program_file)
+    if not fm:
+        errors.append("No YAML frontmatter found in specs/PROGRAM.md")
+    else:
+        prog_type = fm.get("type", "")
+        if prog_type and prog_type not in VALID_TYPES:
+            errors.append(
+                f"Invalid type '{prog_type}' — "
+                f"must be one of: {', '.join(sorted(VALID_TYPES))}"
+            )
+
+        iterations = fm.get("iterations", "5")
+        if not iterations.isdigit() or int(iterations) < 1:
+            errors.append(f"Invalid iterations '{iterations}' — must be a positive integer")
+
+        threshold = fm.get("completion_threshold", "90")
+        if not threshold.isdigit() or not (0 <= int(threshold) <= 100):
+            errors.append(f"Invalid completion_threshold '{threshold}' — must be 0-100")
+
+    # Validate goal
+    goal = parse_goal(program_file)
+    if goal == "(not set)":
+        errors.append("No goal defined — fill in the ## Goal section in specs/PROGRAM.md")
+
+    # Validate success criteria
+    if not section_has_content(restrictions_file, "Success Criteria"):
+        errors.append("No success criteria — add items to ## Success Criteria in specs/RESTRICTIONS.md")
+
+    # Check for hard constraints in restrictions
+    hard = count_constraints(restrictions_file, "Hard Constraints")
+    if hard == 0:
+        warnings.append("No hard constraints in specs/RESTRICTIONS.md — the evaluator has nothing to enforce")
+
+    # Check soft constraints
+    soft = count_constraints(restrictions_file, "Soft Constraints")
+    if soft == 0:
+        warnings.append("No soft constraints in specs/RESTRICTIONS.md")
+
+    # Check context section
+    if not section_has_content(program_file, "Context"):
+        warnings.append("Empty ## Context section — consider adding background for the producer")
+
+    return errors, warnings
+
+
+# --- Monitored loop runner ---
+
+def run_monitored_loop(
+    cmd: list[str],
+    tool_label: str,
+    goal: str,
+    prog_type: str,
+    max_iter: int,
+    threshold: int,
+    hard: int,
+    soft: int,
+    output_dir: str,
+    allowed_tools: Optional[list[str]] = None,
+) -> tuple[int, bool]:
+    """Run a headless AI tool with live monitoring.
+
+    Returns (exit_code, stopped_by_user).
+    """
+    start_time = int(time.time())
+    log_file = Path(".letcook.log")
+    stopped_by_user = False
+    prev_iteration = 0
+    iteration_start_time = start_time
+    iteration_durations: list[float] = []
+
+    with open(log_file, "w") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+
+        old_settings = None
+        stdin_fd = sys.stdin.fileno()
+        try:
+            old_settings = termios.tcgetattr(stdin_fd)
+            tty.setcbreak(stdin_fd)
+        except (termios.error, OSError):
+            pass
+
+        try:
+            while proc.poll() is None:
+                loop_state_file = Path("loop-state.md")
+                iteration, score, status = parse_loop_state(loop_state_file)
+                scores = parse_score_history(loop_state_file)
+
+                # Track iteration durations for ETA
+                now = int(time.time())
+                if iteration > prev_iteration:
+                    if prev_iteration > 0:
+                        duration = now - iteration_start_time
+                        iteration_durations.append(duration)
+                    iteration_start_time = now
+                    prev_iteration = iteration
+
+                # Calculate ETA
+                eta = None
+                if iteration > 0 and iteration_durations:
+                    avg_dur = sum(iteration_durations) / len(iteration_durations)
+                    remaining = max_iter - iteration
+                    if remaining > 0:
+                        eta = format_elapsed(int(avg_dur * remaining))
+
+                if proc.poll() is None:
+                    status = status if status != "ready" else "running"
+                elapsed = format_elapsed(now - start_time)
+
+                console.clear()
+                console.print(build_status_panel(
+                    goal, prog_type, tool_label, iteration, max_iter,
+                    threshold, score, status, elapsed, hard, soft,
+                    output_dir, allowed_tools=allowed_tools,
+                    scores=scores, eta=eta,
+                ))
+
+                if old_settings is not None:
+                    ready, _, _ = select.select([stdin_fd], [], [], 3)
+                    if ready:
+                        ch = os.read(stdin_fd, 1)
+                        if ch == b'\x1b':
+                            stopped_by_user = True
+                            proc.send_signal(signal.SIGTERM)
+                            proc.wait(timeout=10)
+                            break
+                else:
+                    time.sleep(3)
+        except KeyboardInterrupt:
+            stopped_by_user = True
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+        finally:
+            if old_settings is not None:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+
+        exit_code = proc.returncode or 0
+
+    # Final status display
+    loop_state_file = Path("loop-state.md")
+    iteration, score, status = parse_loop_state(loop_state_file)
+    scores = parse_score_history(loop_state_file)
+    if stopped_by_user:
+        status = "stopped"
+    elapsed = format_elapsed(int(time.time()) - start_time)
+
+    console.clear()
+    console.print(build_status_panel(
+        goal, prog_type, tool_label, iteration, max_iter, threshold,
+        score, status, elapsed, hard, soft, output_dir,
+        allowed_tools=allowed_tools, scores=scores,
+    ))
+    console.print()
+
+    if stopped_by_user:
+        console.print("[bold yellow]⏹ Stopped by user.[/bold yellow]")
+    elif exit_code == 0:
+        console.print("[bold green]✓ Done.[/bold green]")
+    else:
+        console.print(f"[bold red]✗ Tool exited with code {exit_code}[/bold red]")
+
+    return exit_code, stopped_by_user
+
+
+# --- Post-loop interactive menu ---
+
+def read_key_with_timeout(timeout: float = 0.0) -> Optional[str]:
+    """Read a single keypress, optionally with timeout. Returns None on timeout."""
+    stdin_fd = sys.stdin.fileno()
+    old_settings = None
+    try:
+        old_settings = termios.tcgetattr(stdin_fd)
+        tty.setcbreak(stdin_fd)
+        if timeout > 0:
+            ready, _, _ = select.select([stdin_fd], [], [], timeout)
+            if not ready:
+                return None
+        ch = os.read(stdin_fd, 1)
+        return ch.decode("utf-8", errors="ignore")
+    except (termios.error, OSError):
+        return None
+    finally:
+        if old_settings is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+
+
+def print_loop_summary(loop_state_file: Path) -> None:
+    """Print the Summary section from loop-state.md."""
+    if not loop_state_file.exists():
+        console.print("[dim]No loop-state.md found.[/dim]")
+        return
+
+    lines = loop_state_file.read_text().splitlines()
+    in_summary = False
+    summary_lines: list[str] = []
+    for line in lines:
+        if re.match(r"^##\s+Summary", line):
+            in_summary = True
+            continue
+        if in_summary:
+            if re.match(r"^##\s", line):
+                break
+            summary_lines.append(line)
+
+    if not summary_lines:
+        console.print("[dim]No summary section found in loop-state.md.[/dim]")
+        return
+
+    console.print(Panel(
+        "\n".join(summary_lines).strip(),
+        title="[bold]Summary[/bold]",
+        border_style="green",
+        padding=(1, 2),
+    ))
+
+
+def show_git_diff() -> None:
+    """Show git diff --stat for changes made during the run."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--stat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.stdout.strip():
+            console.print(Panel(
+                result.stdout.strip(),
+                title="[bold]Changes[/bold]",
+                border_style="cyan",
+                padding=(1, 2),
+            ))
+        else:
+            console.print("[dim]No uncommitted changes detected.[/dim]")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        console.print("[dim]Could not run git diff.[/dim]")
+
+
+def post_loop_menu(
+    tool_label: str,
+    goal: str,
+    prog_type: str,
+    max_iter: int,
+    threshold: int,
+    hard: int,
+    soft: int,
+    output_dir: str,
+    allowed_tools: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Show interactive post-loop menu. Returns 'continue' or None."""
+    console.print()
+    console.print(Panel(
+        "  [bold cyan][s][/bold cyan] Show summary\n"
+        "  [bold cyan][d][/bold cyan] Show diff\n"
+        "  [bold cyan][c][/bold cyan] Continue with more iterations\n"
+        "  [bold cyan][q][/bold cyan] Quit",
+        title="[bold]What next?[/bold]",
+        border_style="bright_blue",
+        padding=(1, 2),
+        width=44,
+    ))
+
+    while True:
+        key = read_key_with_timeout(timeout=60.0)
+        if key is None:
+            return None
+        if key == "q":
+            return None
+        if key == "s":
+            console.print()
+            print_loop_summary(Path("loop-state.md"))
+            console.print("\n[dim]Press any key to return to menu, q to quit[/dim]")
+            k = read_key_with_timeout(timeout=60.0)
+            if k == "q":
+                return None
+            console.print()
+            console.print(Panel(
+                "  [bold cyan][s][/bold cyan] Show summary\n"
+                "  [bold cyan][d][/bold cyan] Show diff\n"
+                "  [bold cyan][c][/bold cyan] Continue with more iterations\n"
+                "  [bold cyan][q][/bold cyan] Quit",
+                title="[bold]What next?[/bold]",
+                border_style="bright_blue",
+                padding=(1, 2),
+                width=44,
+            ))
+        elif key == "d":
+            console.print()
+            show_git_diff()
+            console.print("\n[dim]Press any key to return to menu, q to quit[/dim]")
+            k = read_key_with_timeout(timeout=60.0)
+            if k == "q":
+                return None
+            console.print()
+            console.print(Panel(
+                "  [bold cyan][s][/bold cyan] Show summary\n"
+                "  [bold cyan][d][/bold cyan] Show diff\n"
+                "  [bold cyan][c][/bold cyan] Continue with more iterations\n"
+                "  [bold cyan][q][/bold cyan] Quit",
+                title="[bold]What next?[/bold]",
+                border_style="bright_blue",
+                padding=(1, 2),
+                width=44,
+            ))
+        elif key == "c":
+            return "continue"
+
+
 # --- Commands ---
 
 def cmd_help() -> None:
@@ -340,8 +734,10 @@ def cmd_help() -> None:
     help_table.add_column("Command", style="bold cyan", no_wrap=True)
     help_table.add_column("Description")
 
-    help_table.add_row("init [dir]", "Scaffold a new project")
+    help_table.add_row("init [dir] [--type TYPE]", "Scaffold a new project")
     help_table.add_row("run  [dir] [tool]", "Run the loop with a specific tool")
+    help_table.add_row("continue [dir] [tool]", "Resume a previous run")
+    help_table.add_row("validate [dir]", "Check project files before running")
     help_table.add_row("help", "Show this help")
     help_table.add_row("version", "Show version")
 
@@ -372,12 +768,34 @@ def cmd_help() -> None:
     console.print(tools_table)
     console.print()
 
+    types_table = Table(
+        show_header=True, box=box.SIMPLE, padding=(0, 1),
+        title="[bold]Project Types[/bold] (for init --type)",
+    )
+    types_table.add_column("Type", style="cyan", no_wrap=True)
+    types_table.add_column("Description", style="dim")
+
+    types = [
+        ("build", "Write code, run tests (default)"),
+        ("research", "Read sources, synthesize findings"),
+        ("content", "Write articles, scripts, media"),
+        ("experiment", "Run experiments, log metrics"),
+        ("refactor", "Restructure existing code"),
+    ]
+    for name, desc in types:
+        types_table.add_row(name, desc)
+
+    console.print(types_table)
+    console.print()
+
     console.print("[dim]Examples:[/dim]")
-    console.print("  letcook init                          [dim]# scaffold in current dir[/dim]")
-    console.print("  letcook init ./my-task                [dim]# scaffold in a subdirectory[/dim]")
-    console.print("  letcook run  claude                   [dim]# run in current dir with Claude[/dim]")
-    console.print("  letcook run  qubito                   [dim]# run in current dir with Qubito[/dim]")
-    console.print("  letcook run  ./my-task claude          [dim]# run a specific task[/dim]")
+    console.print("  letcook init                            [dim]# scaffold in current dir[/dim]")
+    console.print("  letcook init ./my-task                  [dim]# scaffold in a subdirectory[/dim]")
+    console.print("  letcook init ./my-task --type research  [dim]# scaffold with research templates[/dim]")
+    console.print("  letcook run  claude                     [dim]# run in current dir with Claude[/dim]")
+    console.print("  letcook run  ./my-task claude           [dim]# run a specific task[/dim]")
+    console.print("  letcook continue ./my-task claude       [dim]# resume a previous run[/dim]")
+    console.print("  letcook validate ./my-task              [dim]# check project before running[/dim]")
     console.print()
 
 
@@ -387,8 +805,25 @@ def cmd_version() -> None:
 
 
 def cmd_init(args: list[str]) -> None:
-    """Scaffold a new project."""
-    target_dir = Path(args[0]) if args else Path(".")
+    """Scaffold a new project, optionally with type-specific templates."""
+    target_dir = Path(".")
+    proj_type = "build"
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--type" and i + 1 < len(args):
+            proj_type = args[i + 1]
+            i += 2
+        else:
+            target_dir = Path(args[i])
+            i += 1
+
+    if proj_type not in VALID_TYPES:
+        console.print(
+            f"[bold red]Invalid type '{proj_type}'[/bold red] — "
+            f"must be one of: {', '.join(sorted(VALID_TYPES))}"
+        )
+        sys.exit(1)
 
     specs_dir = target_dir / "specs"
     specs_dir.mkdir(parents=True, exist_ok=True)
@@ -396,28 +831,83 @@ def cmd_init(args: list[str]) -> None:
     console.print()
     console.print(
         Panel(
-            "[bold]Initializing autonomous loop project…[/bold]",
+            f"[bold]Initializing [cyan]{proj_type}[/cyan] project…[/bold]",
             border_style="bright_blue",
             padding=(0, 1),
         )
     )
     console.print()
 
-    copy_if_missing(LETCOOK_HOME / "skill.md", specs_dir / "skill.md")
-    copy_if_missing(
-        LETCOOK_HOME / "templates" / "program.md", specs_dir / "program.md"
-    )
-    copy_if_missing(
-        LETCOOK_HOME / "templates" / "restrictions.md", specs_dir / "restrictions.md"
-    )
+    copy_if_missing(LETCOOK_HOME / "SKILL.md", specs_dir / "SKILL.md")
+
+    # Use type-specific templates if available, otherwise fall back to generic
+    type_template_dir = LETCOOK_HOME / "templates" / proj_type
+    if type_template_dir.exists():
+        copy_if_missing(type_template_dir / "PROGRAM.md", specs_dir / "PROGRAM.md")
+        copy_if_missing(
+            type_template_dir / "RESTRICTIONS.md", specs_dir / "RESTRICTIONS.md"
+        )
+    else:
+        copy_if_missing(
+            LETCOOK_HOME / "templates" / "PROGRAM.md", specs_dir / "PROGRAM.md"
+        )
+        copy_if_missing(
+            LETCOOK_HOME / "templates" / "RESTRICTIONS.md",
+            specs_dir / "RESTRICTIONS.md",
+        )
 
     console.print()
     console.print("[bold green]Project initialized![/bold green]")
     console.print()
     console.print("[dim]Next steps:[/dim]")
-    console.print(f"  1. Edit [bold]{specs_dir}/program.md[/bold]      — define your task")
-    console.print(f"  2. Edit [bold]{specs_dir}/restrictions.md[/bold] — set quality gates")
-    console.print(f"  3. Run:  [cyan]letcook run {target_dir}[/cyan]")
+    console.print(f"  1. Edit [bold]{specs_dir}/PROGRAM.md[/bold]      — define your task")
+    console.print(f"  2. Edit [bold]{specs_dir}/RESTRICTIONS.md[/bold] — set quality gates")
+    console.print(f"  3. Validate: [cyan]letcook validate {target_dir}[/cyan]")
+    console.print(f"  4. Run:      [cyan]letcook run {target_dir}[/cyan]")
+    console.print()
+
+
+def cmd_validate(args: list[str]) -> None:
+    """Validate project files before running."""
+    target_dir = Path(args[0]) if args else Path(".")
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]Validating project in [cyan]{target_dir}[/cyan]…[/bold]",
+            border_style="bright_blue",
+            padding=(0, 1),
+        )
+    )
+    console.print()
+
+    errors, warnings = validate_project(target_dir)
+
+    if errors:
+        for err in errors:
+            console.print(f"  [bold red]✗[/bold red] {err}")
+    if warnings:
+        for warn in warnings:
+            console.print(f"  [yellow]△[/yellow] {warn}")
+
+    if not errors and not warnings:
+        console.print("  [bold green]✓[/bold green] All checks passed")
+
+    console.print()
+
+    if errors:
+        console.print(
+            f"[bold red]Found {len(errors)} error(s).[/bold red] "
+            "Fix them before running."
+        )
+        sys.exit(1)
+    elif warnings:
+        console.print(
+            f"[yellow]{len(warnings)} warning(s)[/yellow] — "
+            "consider addressing these for better results."
+        )
+    else:
+        console.print("[bold green]Ready to run![/bold green]")
     console.print()
 
 
@@ -432,11 +922,10 @@ def get_allowed_tools(prog_type: str, extra_tools: str = "") -> list[str]:
     return tools
 
 
-def cmd_run(args: list[str]) -> None:
-    """Run the autonomous loop."""
+def _parse_run_args(args: list[str]) -> tuple[Path, str]:
+    """Parse [dir] and [tool] from run/continue args."""
     target_dir = Path(".")
     tool = ""
-
     i = 0
     while i < len(args):
         if args[i] == "--tool" and i + 1 < len(args):
@@ -448,213 +937,103 @@ def cmd_run(args: list[str]) -> None:
         else:
             target_dir = Path(args[i])
             i += 1
+    return target_dir, tool
 
-    # Validate project files
-    for spec in ["specs/skill.md", "specs/program.md", "specs/restrictions.md"]:
-        if not (target_dir / spec).exists():
-            console.print(f"[bold red]Missing {target_dir / spec}[/bold red]")
-            console.print(f"Run [cyan]letcook init {target_dir}[/cyan] first.")
-            sys.exit(1)
 
-    prompt = (
-        "Read specs/skill.md, specs/program.md, and specs/restrictions.md, "
-        "then execute the autonomous loop as defined in specs/skill.md."
-    )
-
-    # Auto-detect tool
-    detected = ""
-    if not tool:
-        for candidate in ["claude", "qubito", "aider", "codex", "copilot"]:
-            if shutil.which(candidate):
-                tool = candidate
-                detected = " (auto-detected)"
-                break
-
-    # Parse project metadata
-    program_file = target_dir / "specs" / "program.md"
-    restrictions_file = target_dir / "specs" / "restrictions.md"
+def _load_project_metadata(target_dir: Path) -> dict:
+    """Load and parse project metadata from specs files."""
+    program_file = target_dir / "specs" / "PROGRAM.md"
+    restrictions_file = target_dir / "specs" / "RESTRICTIONS.md"
 
     fm = parse_frontmatter(program_file)
-    prog_type = fm.get("type", "build")
-    max_iter = int(fm.get("iterations", "5"))
-    threshold = int(fm.get("completion_threshold", "90"))
-    output_dir = fm.get("output", "./output/")
-    extra_tools = fm.get("tools", "")
-    goal = parse_goal(program_file)
-    hard = count_constraints(restrictions_file, "Hard Constraints")
-    soft = count_constraints(restrictions_file, "Soft Constraints")
+    return {
+        "prog_type": fm.get("type", "build"),
+        "max_iter": int(fm.get("iterations", "5")),
+        "threshold": int(fm.get("completion_threshold", "90")),
+        "output_dir": fm.get("output", "./output/"),
+        "extra_tools": fm.get("tools", ""),
+        "goal": parse_goal(program_file),
+        "hard": count_constraints(restrictions_file, "Hard Constraints"),
+        "soft": count_constraints(restrictions_file, "Soft Constraints"),
+    }
 
-    console.print()
 
+def _run_with_tool(
+    tool: str,
+    detected: str,
+    target_dir: Path,
+    prompt: str,
+    meta: dict,
+    is_continue: bool = False,
+) -> None:
+    """Dispatch to the appropriate tool runner."""
     if tool == "claude":
-        allowed_tools = get_allowed_tools(prog_type, extra_tools)
+        allowed_tools = get_allowed_tools(meta["prog_type"], meta["extra_tools"])
         allowed_tools_str = ",".join(allowed_tools)
         tool_label = f"claude{detected}"
-        start_time = int(time.time())
 
         os.chdir(target_dir)
-        log_file = Path(".letcook.log")
-        stopped_by_user = False
 
-        with open(log_file, "w") as log:
-            proc = subprocess.Popen(
-                ["claude", "-p", prompt, "--allowedTools", allowed_tools_str],
-                stdout=log, stderr=subprocess.STDOUT,
-            )
-
-            # Set terminal to raw mode to catch ESC
-            old_settings = None
-            stdin_fd = sys.stdin.fileno()
-            try:
-                old_settings = termios.tcgetattr(stdin_fd)
-                tty.setcbreak(stdin_fd)
-            except (termios.error, OSError):
-                pass  # not a tty
-
-            try:
-                while proc.poll() is None:
-                    # Update status display
-                    iteration, score, status = parse_loop_state(
-                        Path("loop-state.md")
-                    )
-                    if proc.poll() is None:
-                        status = status if status != "ready" else "running"
-                    elapsed = format_elapsed(int(time.time()) - start_time)
-
-                    console.clear()
-                    console.print(build_status_panel(
-                        goal, prog_type, tool_label, iteration, max_iter,
-                        threshold, score, status, elapsed, hard, soft,
-                        output_dir, allowed_tools=allowed_tools,
-                    ))
-
-                    # Check for ESC key (poll stdin for 3 seconds)
-                    if old_settings is not None:
-                        ready, _, _ = select.select([stdin_fd], [], [], 3)
-                        if ready:
-                            ch = os.read(stdin_fd, 1)
-                            if ch == b'\x1b':  # ESC
-                                stopped_by_user = True
-                                proc.send_signal(signal.SIGTERM)
-                                proc.wait(timeout=10)
-                                break
-                    else:
-                        time.sleep(3)
-            except KeyboardInterrupt:
-                stopped_by_user = True
-                proc.send_signal(signal.SIGTERM)
-                proc.wait(timeout=10)
-            finally:
-                if old_settings is not None:
-                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
-
-            exit_code = proc.returncode or 0
-
-        # Final status
-        iteration, score, status = parse_loop_state(Path("loop-state.md"))
-        if stopped_by_user:
-            status = "stopped"
-        elapsed = format_elapsed(int(time.time()) - start_time)
-
-        console.clear()
-        panel = build_status_panel(
-            goal, prog_type, tool_label, iteration, max_iter, threshold,
-            score, status, elapsed, hard, soft, output_dir,
+        exit_code, stopped = run_monitored_loop(
+            cmd=["claude", "-p", prompt, "--allowedTools", allowed_tools_str],
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
             allowed_tools=allowed_tools,
         )
-        console.print(panel)
-        console.print()
 
-        if stopped_by_user:
-            console.print("[bold yellow]⏹ Stopped by user.[/bold yellow]")
-        elif exit_code == 0:
-            console.print("[bold green]✓ Done.[/bold green]")
-        else:
-            console.print(
-                f"[bold red]✗ Claude exited with code {exit_code}[/bold red]"
-            )
+        # Post-loop menu
+        action = post_loop_menu(
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
+            allowed_tools=allowed_tools,
+        )
+        if action == "continue" and not is_continue:
+            _do_continue_loop(tool, detected, meta)
+
         sys.exit(exit_code)
 
     elif tool == "qubito":
         tool_label = f"qubito{detected}"
-        start_time = int(time.time())
 
         os.chdir(target_dir)
-        log_file = Path(".letcook.log")
-        stopped_by_user = False
 
-        with open(log_file, "w") as log:
-            proc = subprocess.Popen(
-                ["qubito", "-p", prompt],
-                stdout=log, stderr=subprocess.STDOUT,
-            )
-
-            old_settings = None
-            stdin_fd = sys.stdin.fileno()
-            try:
-                old_settings = termios.tcgetattr(stdin_fd)
-                tty.setcbreak(stdin_fd)
-            except (termios.error, OSError):
-                pass
-
-            try:
-                while proc.poll() is None:
-                    iteration, score, status = parse_loop_state(
-                        Path("loop-state.md")
-                    )
-                    if proc.poll() is None:
-                        status = status if status != "ready" else "running"
-                    elapsed = format_elapsed(int(time.time()) - start_time)
-
-                    console.clear()
-                    console.print(build_status_panel(
-                        goal, prog_type, tool_label, iteration, max_iter,
-                        threshold, score, status, elapsed, hard, soft,
-                        output_dir,
-                    ))
-
-                    if old_settings is not None:
-                        ready, _, _ = select.select([stdin_fd], [], [], 3)
-                        if ready:
-                            ch = os.read(stdin_fd, 1)
-                            if ch == b'\x1b':
-                                stopped_by_user = True
-                                proc.send_signal(signal.SIGTERM)
-                                proc.wait(timeout=10)
-                                break
-                    else:
-                        time.sleep(3)
-            except KeyboardInterrupt:
-                stopped_by_user = True
-                proc.send_signal(signal.SIGTERM)
-                proc.wait(timeout=10)
-            finally:
-                if old_settings is not None:
-                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
-
-            exit_code = proc.returncode or 0
-
-        iteration, score, status = parse_loop_state(Path("loop-state.md"))
-        if stopped_by_user:
-            status = "stopped"
-        elapsed = format_elapsed(int(time.time()) - start_time)
-
-        console.clear()
-        panel = build_status_panel(
-            goal, prog_type, tool_label, iteration, max_iter, threshold,
-            score, status, elapsed, hard, soft, output_dir,
+        exit_code, stopped = run_monitored_loop(
+            cmd=["qubito", "-p", prompt],
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
         )
-        console.print(panel)
-        console.print()
 
-        if stopped_by_user:
-            console.print("[bold yellow]⏹ Stopped by user.[/bold yellow]")
-        elif exit_code == 0:
-            console.print("[bold green]✓ Done.[/bold green]")
-        else:
-            console.print(
-                f"[bold red]✗ Qubito exited with code {exit_code}[/bold red]"
-            )
+        action = post_loop_menu(
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
+        )
+        if action == "continue" and not is_continue:
+            _do_continue_loop(tool, detected, meta)
+
         sys.exit(exit_code)
 
     elif tool == "aider":
@@ -662,9 +1041,9 @@ def cmd_run(args: list[str]) -> None:
         console.print()
         os.execvp("aider", [
             "aider",
-            "--read", str(target_dir / "specs" / "skill.md"),
-            "--read", str(target_dir / "specs" / "program.md"),
-            "--read", str(target_dir / "specs" / "restrictions.md"),
+            "--read", str(target_dir / "specs" / "SKILL.md"),
+            "--read", str(target_dir / "specs" / "PROGRAM.md"),
+            "--read", str(target_dir / "specs" / "RESTRICTIONS.md"),
             "--message", prompt,
         ])
 
@@ -697,13 +1076,138 @@ def cmd_run(args: list[str]) -> None:
     else:
         console.print(
             Panel(
-                f"[bold yellow]Tool '{tool}' doesn't support headless execution.[/bold yellow]\n\n"
+                f"[bold yellow]Tool '{tool}' doesn't support headless execution."
+                "[/bold yellow]\n\n"
                 f"Open the project in your IDE and tell the AI:\n\n"
                 "  [bold]Start working on this project.[/bold]",
                 border_style="yellow",
                 padding=(1, 2),
             )
         )
+
+
+def _do_continue_loop(tool: str, detected: str, meta: dict) -> None:
+    """Run a continue loop from within the post-loop menu."""
+    loop_state_file = Path("loop-state.md")
+    iteration, score, status = parse_loop_state(loop_state_file)
+
+    continue_prompt = (
+        f"Read specs/SKILL.md, specs/PROGRAM.md, specs/RESTRICTIONS.md, and loop-state.md. "
+        f"The previous run ended at iteration {iteration} with score {score}. "
+        f"Continue the autonomous loop for up to {meta['max_iter']} more iterations. "
+        f"Resume from the current state and address the evaluator's feedback."
+    )
+
+    if tool == "claude":
+        allowed_tools = get_allowed_tools(meta["prog_type"], meta["extra_tools"])
+        allowed_tools_str = ",".join(allowed_tools)
+        tool_label = f"claude{detected}"
+
+        exit_code, _ = run_monitored_loop(
+            cmd=["claude", "-p", continue_prompt, "--allowedTools", allowed_tools_str],
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
+            allowed_tools=allowed_tools,
+        )
+    elif tool == "qubito":
+        tool_label = f"qubito{detected}"
+        exit_code, _ = run_monitored_loop(
+            cmd=["qubito", "-p", continue_prompt],
+            tool_label=tool_label,
+            goal=meta["goal"],
+            prog_type=meta["prog_type"],
+            max_iter=meta["max_iter"],
+            threshold=meta["threshold"],
+            hard=meta["hard"],
+            soft=meta["soft"],
+            output_dir=meta["output_dir"],
+        )
+
+
+def cmd_run(args: list[str]) -> None:
+    """Run the autonomous loop."""
+    target_dir, tool = _parse_run_args(args)
+
+    # Validate project files
+    for spec in ["specs/SKILL.md", "specs/PROGRAM.md", "specs/RESTRICTIONS.md"]:
+        if not (target_dir / spec).exists():
+            console.print(f"[bold red]Missing {target_dir / spec}[/bold red]")
+            console.print(f"Run [cyan]letcook init {target_dir}[/cyan] first.")
+            sys.exit(1)
+
+    prompt = (
+        "Read specs/SKILL.md, specs/PROGRAM.md, and specs/RESTRICTIONS.md, "
+        "then execute the autonomous loop as defined in specs/SKILL.md."
+    )
+
+    # Auto-detect tool
+    detected = ""
+    if not tool:
+        for candidate in ["claude", "qubito", "aider", "codex", "copilot"]:
+            if shutil.which(candidate):
+                tool = candidate
+                detected = " (auto-detected)"
+                break
+
+    meta = _load_project_metadata(target_dir)
+
+    console.print()
+    _run_with_tool(tool, detected, target_dir, prompt, meta)
+
+
+def cmd_continue(args: list[str]) -> None:
+    """Continue a previous run from where it left off."""
+    target_dir, tool = _parse_run_args(args)
+
+    # Validate project files
+    for spec in ["specs/SKILL.md", "specs/PROGRAM.md", "specs/RESTRICTIONS.md"]:
+        if not (target_dir / spec).exists():
+            console.print(f"[bold red]Missing {target_dir / spec}[/bold red]")
+            console.print(f"Run [cyan]letcook init {target_dir}[/cyan] first.")
+            sys.exit(1)
+
+    loop_state_file = target_dir / "loop-state.md"
+    if not loop_state_file.exists():
+        console.print("[bold red]No loop-state.md found.[/bold red]")
+        console.print("Run [cyan]letcook run[/cyan] first to start a loop.")
+        sys.exit(1)
+
+    iteration, score, status = parse_loop_state(loop_state_file)
+    meta = _load_project_metadata(target_dir)
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]Continuing from iteration {iteration} "
+            f"(score: {score})…[/bold]",
+            border_style="bright_blue",
+            padding=(0, 1),
+        )
+    )
+
+    prompt = (
+        f"Read specs/SKILL.md, specs/PROGRAM.md, specs/RESTRICTIONS.md, and loop-state.md. "
+        f"The previous run ended at iteration {iteration} with score {score}. "
+        f"Continue the autonomous loop for up to {meta['max_iter']} more iterations. "
+        f"Resume from the current state and address the evaluator's feedback."
+    )
+
+    # Auto-detect tool
+    detected = ""
+    if not tool:
+        for candidate in ["claude", "qubito", "aider", "codex", "copilot"]:
+            if shutil.which(candidate):
+                tool = candidate
+                detected = " (auto-detected)"
+                break
+
+    _run_with_tool(tool, detected, target_dir, prompt, meta, is_continue=True)
 
 
 # --- Main ---
@@ -717,6 +1221,8 @@ def main() -> None:
     commands: dict[str, object] = {
         "init": lambda: cmd_init(rest),
         "run": lambda: cmd_run(rest),
+        "continue": lambda: cmd_continue(rest),
+        "validate": lambda: cmd_validate(rest),
         "help": cmd_help,
         "version": cmd_version,
     }

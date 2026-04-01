@@ -68,8 +68,8 @@ make uninstall
 letcook init ./my-task
 
 # 2. Edit the files
-vim ./my-task/program.md         # define your task
-vim ./my-task/restrictions.md    # set quality gates
+vim ./my-task/PROGRAM.md         # define your task
+vim ./my-task/RESTRICTIONS.md    # set quality gates
 
 # 3. Let them cook
 letcook run ./my-task
@@ -88,7 +88,7 @@ letcook version                      Show version
 
 ### `letcook init`
 
-Creates `program.md`, `restrictions.md`, and `skill.md` in the target directory:
+Creates `PROGRAM.md`, `RESTRICTIONS.md`, and `SKILL.md` in the target directory:
 
 ```bash
 letcook init ./my-task                  # core files only
@@ -103,9 +103,9 @@ Output:
 
 ```
 my-task/
-├── program.md        <- Define your task here
-├── restrictions.md   <- Set quality gates here
-└── skill.md          <- Execution engine (don't edit)
+├── PROGRAM.md        <- Define your task here
+├── RESTRICTIONS.md   <- Set quality gates here
+└── SKILL.md          <- Execution engine (don't edit)
 ```
 
 ### `letcook run`
@@ -132,7 +132,7 @@ What happens per tool:
 
 ## Defining a Task
 
-### program.md
+### PROGRAM.md
 
 The task definition. YAML frontmatter for config, markdown for instructions:
 
@@ -154,24 +154,24 @@ Build a Python CLI that converts markdown to HTML with syntax highlighting.
 
 Use only stdlib + pygments. Target Python 3.10+.
 
-## Success Criteria
-
-- [ ] (hard) Accepts a file path argument or reads from stdin
-- [ ] (hard) Produces valid HTML5 output
-- [ ] (soft) Handles tables, lists, blockquotes
-- [ ] (soft) Includes a --theme flag
-
 ## Notes
 
 Keep it to a single file.
 ```
 
-### restrictions.md
+### RESTRICTIONS.md
 
-Quality gates the evaluator checks every iteration:
+Quality gates and success criteria the evaluator checks every iteration:
 
 ```markdown
 # Restrictions
+
+## Success Criteria        <- task-specific goals, scored each iteration
+
+- [ ] (hard) Accepts a file path argument or reads from stdin
+- [ ] (hard) Produces valid HTML5 output
+- [ ] (soft) Handles tables, lists, blockquotes
+- [ ] (soft) Includes a --theme flag
 
 ## Hard Constraints        <- must ALL pass or the iteration fails
 
@@ -224,7 +224,7 @@ letcook run ./my-task --tool claude
 
 # With custom tool permissions
 claude -p \
-  "Read skill.md, program.md, and restrictions.md, then execute the autonomous loop." \
+  "Read SKILL.md, PROGRAM.md, and RESTRICTIONS.md, then execute the autonomous loop." \
   --allowedTools "Read,Write,Edit,Bash,Glob,Grep,Agent" \
   --max-turns 200 \
   --max-budget-usd 10.00
@@ -271,15 +271,15 @@ letcook init ./my-task --tool aider
 letcook run ./my-task --tool aider
 
 # Or manually:
-aider --read skill.md --read program.md --read restrictions.md \
-  --message "Execute the autonomous loop as defined in skill.md."
+aider --read SKILL.md --read PROGRAM.md --read RESTRICTIONS.md \
+  --message "Execute the autonomous loop as defined in SKILL.md."
 ```
 
 ### Any other tool
 
 The universal prompt works with any AI assistant:
 
-> Read skill.md, program.md, and restrictions.md, then execute the autonomous loop as defined in skill.md.
+> Read SKILL.md, PROGRAM.md, and RESTRICTIONS.md, then execute the autonomous loop as defined in SKILL.md.
 
 ## Repository Structure
 
@@ -288,10 +288,10 @@ letcook/
 ├── bin/letcook                               # CLI binary
 ├── install.sh                                # One-liner install script
 ├── Makefile                                  # make install / uninstall / link
-├── skill.md                                  # Execution engine (vendor-neutral)
+├── SKILL.md                                  # Execution engine (vendor-neutral)
 ├── templates/
-│   ├── program.md                            # Task definition template
-│   └── restrictions.md                       # Quality gates template
+│   ├── PROGRAM.md                            # Task definition template
+│   └── RESTRICTIONS.md                       # Quality gates template
 ├── integrations/
 │   ├── claude/skills/                        # Claude Code /start-project, /start-working
 │   ├── cursor/autonomous-loop.mdc            # Cursor rules
@@ -299,8 +299,8 @@ letcook/
 │   ├── continue/autonomous-loop.md           # Continue.dev rules
 │   └── aider/.aider.conf.yml                 # Aider config
 └── examples/
-    ├── program.md                            # Example task
-    └── restrictions.md                       # Example restrictions
+    ├── PROGRAM.md                            # Example task
+    └── RESTRICTIONS.md                       # Example restrictions
 ```
 
 ## Acknowledgments

@@ -1,6 +1,6 @@
 ---
 name: start-project
-description: Scaffold a new autonomous loop project. Copies specs/program.md, specs/restrictions.md, and specs/skill.md into the target directory so the user can define the task and run /start-working.
+description: Scaffold a new autonomous loop project. Copies specs/PROGRAM.md, specs/RESTRICTIONS.md, and specs/SKILL.md into the target directory so the user can define the task and run /start-working.
 argument-hint: [path/to/directory]
 ---
 
@@ -11,22 +11,22 @@ Initialize an autonomous loop project in `$ARGUMENTS` (or the current directory 
 1. Determine the target directory from `$ARGUMENTS` (default: `.`).
 2. Create the target directory if it doesn't exist.
 3. Copy the following files into the target directory's `specs/` subdirectory **only if they don't already exist** (never overwrite):
-   - `specs/program.md` — from the template below
-   - `specs/restrictions.md` — from the template below
-   - `specs/skill.md` — the execution engine
+   - `specs/PROGRAM.md` — from the template below
+   - `specs/RESTRICTIONS.md` — from the template below
+   - `specs/SKILL.md` — the execution engine
 
 4. Print a summary of what was created and the next steps.
 
 ## Templates
 
-### specs/program.md
+### specs/PROGRAM.md
 
-!`cat templates/program.md`
+!`cat templates/PROGRAM.md`
 
-### specs/restrictions.md
+### specs/RESTRICTIONS.md
 
-!`cat templates/restrictions.md`
+!`cat templates/RESTRICTIONS.md`
 
-### specs/skill.md
+### specs/SKILL.md
 
-!`cat skill.md`
+!`cat SKILL.md`

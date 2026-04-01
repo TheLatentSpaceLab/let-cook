@@ -11,7 +11,7 @@ help: ## Show this help
 install: ## Install letcook to ~/.letcook and symlink to ~/.local/bin
 	@echo "Installing to $(PREFIX)..."
 	@mkdir -p $(PREFIX)
-	@cp -r bin templates integrations skill.md $(PREFIX)/
+	@cp -r bin templates integrations SKILL.md $(PREFIX)/
 	@chmod +x $(PREFIX)/bin/letcook
 	@echo "Setting up Python environment..."
 	@if command -v uv >/dev/null 2>&1; then \
